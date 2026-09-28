@@ -107,12 +107,28 @@ function patchContent(space, message) {
   }
 }
 
+/**
+ * 起线路的每一步都卡个时限。桌面版那边 `await Spectrum()` 没有超时 —— 这里
+ * 哪一步挂住（Photon 接口不回、grpc-web 连不上），状态就永远停在「连接中」，
+ * 退避重试也不会触发。超时抛出来，桌面版的重试照常接手，日志里也知道卡在哪。
+ */
+const STEP_TIMEOUT = 30_000;
+function timed(promise, what) {
+  let t;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      t = setTimeout(() => reject(new Error(`${what}超过 ${STEP_TIMEOUT / 1000} 秒没反应`)), STEP_TIMEOUT);
+    }),
+  ]).finally(() => clearTimeout(t));
+}
+
 export async function Spectrum(opts = {}) {
   let webhookSecret = opts.webhookSecret;
   if (!webhookSecret && opts.projectId && registry) {
-    webhookSecret = await registry.ensure(opts.projectId, opts.projectSecret);
+    webhookSecret = await timed(registry.ensure(opts.projectId, opts.projectSecret), "登记 Photon webhook ");
   }
-  const real = await core.Spectrum({ telemetry: false, ...opts, webhookSecret });
+  const real = await timed(core.Spectrum({ telemetry: false, ...opts, webhookSecret }), "连 Photon ");
   const queue = createQueue();
   const entry = { real, queue };
   live.set(opts.projectId ?? "", entry);
