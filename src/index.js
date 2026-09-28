@@ -23,6 +23,12 @@
  * 另一条路 `Authorization: Bearer <token>`（桌面版登录拿到的会话）也还认：
  * 登录 / 改密码回的 Set-Cookie 翻成 `x-uranus-token` 头。iOS Safari 拦第三方
  * cookie，所以两条路都不走 cookie。
+ *
+ * ── 控制台登录 ──
+ *
+ * 上面两条之外，所有 /api 请求（/api/health 除外）还得带一张控制台登录凭证
+ * `x-uranus-pass`（见 gate.js）：Uranus 小手机的控制台要先登录才能用，
+ * 自己另编一份不登录的界面连不上这里。
  */
 import { DurableObject } from "cloudflare:workers";
 import { handleAsNodeRequest } from "cloudflare:node";
@@ -31,6 +37,7 @@ import { installTimers } from "./shims/timers.js";
 import { installTimeZone } from "./shims/tz.js";
 import { deliverWebhook, setWebhookRegistry, waitLive } from "./shims/spectrum.js";
 import { BUILTIN_PRESETS } from "../core/assets.js";
+import { verifyPass } from "./gate.js";
 
 const PORT = 8787;
 const HEARTBEAT_MS = 30_000;
@@ -175,6 +182,18 @@ export class Uranus extends DurableObject {
 
     if (req.method === "OPTIONS") return withCors(new Response(null, { status: 204 }), req);
 
+    if (url.pathname.startsWith("/api/") && url.pathname !== "/api/health") {
+      if (!(await verifyPass(req.headers.get("x-uranus-pass")))) {
+        return withCors(
+          Response.json(
+            { ok: false, error: "请先在 Uranus 小手机控制台登录（或者登录过期了）。", needPass: true },
+            { status: 401 }
+          ),
+          req
+        );
+      }
+    }
+
     if (url.pathname === "/api/auth/login" && this.auth.mustChangeCredentials()) {
       return withCors(
         Response.json(
@@ -195,6 +214,7 @@ export class Uranus extends DurableObject {
     const bearer = /^Bearer\s+(.+)$/i.exec(headers.get("authorization") ?? "")?.[1];
     headers.delete("cookie");
     headers.delete("x-uranus-key");
+    headers.delete("x-uranus-pass");
     if (key) {
       const session = await this.keySession(key);
       if (!session.ok) {
