@@ -26,7 +26,7 @@
  */
 import { DurableObject } from "cloudflare:workers";
 import { handleAsNodeRequest } from "cloudflare:node";
-import { setBackend, existsSync, writeFileSync } from "./shims/fs.js";
+import { setBackend, existsSync, writeFileSync, installFetchBodies } from "./shims/fs.js";
 import { installTimers } from "./shims/timers.js";
 import { installTimeZone } from "./shims/tz.js";
 import { deliverWebhook, setWebhookRegistry, waitLive } from "./shims/spectrum.js";
@@ -36,12 +36,14 @@ const PORT = 8787;
 const HEARTBEAT_MS = 30_000;
 const PHOTON = "https://spectrum.photon.codes";
 const COOKIE = "uranus_session";
+const RESTORE_PATHS = new Set(["/api/cloud/pull", "/api/backup/full/restore"]);
 
 export class Uranus extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     setBackend(ctx.storage.kv);
     installTimers();
+    installFetchBodies();
     this.kv = ctx.storage.kv;
     this.booting = null;
   }
@@ -200,6 +202,23 @@ export class Uranus extends DurableObject {
       }
       headers.set("cookie", `${COOKIE}=${encodeURIComponent(session.token)}`);
     } else if (bearer) headers.set("cookie", `${COOKIE}=${encodeURIComponent(bearer)}`);
+
+    // 云备份在这边只管往上传：解包要的临时空间和内存 Worker 给不起
+    if (req.method === "POST" && RESTORE_PATHS.has(url.pathname)) {
+      return withCors(
+        Response.json(
+          {
+            ok: false,
+            error:
+              "小手机不支持从备份包恢复。要搬回来的话：配置用「导出配置」那份 JSON 导入，" +
+              "记忆库在记忆库面板里单独导入；或者把包拿到桌面版，用「完整备份」那里恢复。",
+          },
+          { status: 400 }
+        ),
+        req
+      );
+    }
+
     const res = await handleAsNodeRequest(PORT, new Request(req, { headers }));
     return withCors(exposeToken(res), req);
   }

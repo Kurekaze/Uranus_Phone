@@ -13,7 +13,21 @@
  * 所以放模块级全局就够了。
  */
 
+import { Readable, Writable } from "node:stream";
+
 let kv = null;
+
+/*
+ * 临时目录（mkdtemp 建的）不进 KV，放内存里：云备份打出来的包动辄几 MB，
+ * KV 单个值有上限，而且这种文件用完就删，没必要落盘。DO 被收走时一起丢掉正好。
+ */
+const mem = new Map(); // 绝对路径 → Uint8Array | string
+const memRoots = new Set();
+
+function inMem(p) {
+  for (const r of memRoots) if (p === r || p.startsWith(r + "/")) return true;
+  return false;
+}
 
 export function setBackend(storageKv) {
   kv = storageKv;
@@ -49,14 +63,19 @@ function enoent(op, p) {
 
 function isDir(p) {
   if (p === "/") return true;
+  if (memRoots.has(p)) return true;
   if (need().get("d:" + p) !== undefined) return true;
   // 没有显式标记，但底下有文件，也算目录
   for (const _ of need().list({ prefix: "f:" + p + "/", limit: 1 })) return true;
   return false;
 }
 
+function getFile(p) {
+  return inMem(p) ? mem.get(p) : need().get("f:" + p);
+}
+
 function isFile(p) {
-  return need().get("f:" + p) !== undefined;
+  return getFile(p) !== undefined;
 }
 
 function markDirs(p) {
@@ -89,20 +108,21 @@ export function existsSync(p) {
 
 export function readFileSync(p, opts) {
   const n = norm(p);
-  const v = need().get("f:" + n);
+  const v = getFile(n);
   if (v === undefined) throw enoent("open", n);
   return decode(v, encOf(opts));
 }
 
 export function writeFileSync(p, data) {
   const n = norm(p);
+  if (inMem(n)) return void mem.set(n, toStored(data));
   markDirs(parentOf(n));
   need().put("f:" + n, toStored(data));
 }
 
 export function appendFileSync(p, data) {
   const n = norm(p);
-  const old = need().get("f:" + n);
+  const old = getFile(n);
   const prev = old === undefined ? "" : typeof old === "string" ? old : new TextDecoder().decode(old);
   writeFileSync(n, prev + (typeof data === "string" ? data : new TextDecoder().decode(data)));
 }
@@ -135,7 +155,7 @@ export function readdirSync(p, opts) {
 
 export function statSync(p, opts) {
   const n = norm(p);
-  const file = need().get("f:" + n);
+  const file = getFile(n);
   if (file === undefined && !isDir(n)) {
     if (opts?.throwIfNoEntry === false) return undefined;
     throw enoent("stat", n);
@@ -156,6 +176,7 @@ export const lstatSync = statSync;
 export function unlinkSync(p) {
   const n = norm(p);
   if (!isFile(n)) throw enoent("unlink", n);
+  if (inMem(n)) return void mem.delete(n);
   need().delete("f:" + n);
 }
 
@@ -186,6 +207,11 @@ export function copyFileSync(from, to) {
 
 export function rmSync(p, opts) {
   const n = norm(p);
+  if (inMem(n)) {
+    for (const k of [...mem.keys()]) if (k === n || k.startsWith(n + "/")) mem.delete(k);
+    memRoots.delete(n);
+    return;
+  }
   if (isFile(n)) return need().delete("f:" + n);
   if (!isDir(n)) {
     if (opts?.force) return;
@@ -207,11 +233,70 @@ export function closeSync() {}
 export function fsyncSync() {}
 export function writeSync() {}
 
-export function createReadStream() {
-  throw new Error("Worker 里没有文件流（createReadStream）");
+/*
+ * 文件流：内容反正整个在 KV / 内存里，一次读出来包成流就行。
+ * 读流上挂着原始字节（VFS_BYTES）—— Worker 的 fetch 不认 Node 的流当 body，
+ * installFetchBodies 靠它把 body 换回字节（云备份上传就是这么走的）。
+ */
+export const VFS_BYTES = Symbol("uranus.vfsBytes");
+
+export function createReadStream(p) {
+  const bytes = readFileSync(p);
+  const stream = Readable.from([bytes], { objectMode: false });
+  stream[VFS_BYTES] = bytes;
+  return stream;
 }
-export function createWriteStream() {
-  throw new Error("Worker 里没有文件流（createWriteStream）");
+
+export function createWriteStream(p) {
+  const chunks = [];
+  return new Writable({
+    write(chunk, _enc, cb) {
+      chunks.push(typeof chunk === "string" ? new TextEncoder().encode(chunk) : chunk);
+      cb();
+    },
+    final(cb) {
+      try {
+        writeFileSync(p, concat(chunks));
+        cb();
+      } catch (e) {
+        cb(e);
+      }
+    },
+  });
+}
+
+function concat(chunks) {
+  let size = 0;
+  for (const c of chunks) size += c.length;
+  const out = new Uint8Array(size);
+  let at = 0;
+  for (const c of chunks) {
+    out.set(c, at);
+    at += c.length;
+  }
+  return out;
+}
+
+/** 让 fetch 收得下 createReadStream 出来的流（见上面 VFS_BYTES）。启动时调一次。 */
+export function installFetchBodies() {
+  const raw = globalThis.fetch;
+  if (raw.__uranusVfs) return;
+  const wrapped = (input, init) => {
+    if (init?.body?.[VFS_BYTES]) {
+      const { duplex: _d, ...rest } = init;
+      init = { ...rest, body: init.body[VFS_BYTES] };
+    }
+    return raw(input, init);
+  };
+  wrapped.__uranusVfs = true;
+  globalThis.fetch = wrapped;
+}
+
+let tmpSeq = 0;
+export function mkdtempSync(prefix) {
+  const dir = norm(`${prefix}${Date.now().toString(36)}${(tmpSeq++).toString(36)}`);
+  memRoots.add(dir);
+  return dir;
 }
 export function watch() {
   return { close() {} };
@@ -233,12 +318,13 @@ export const promises = {
   copyFile: wrap(copyFileSync),
   rm: wrap(rmSync),
   rmdir: wrap(rmdirSync),
+  mkdtemp: wrap(mkdtempSync),
   access: wrap((p) => { if (!existsSync(p)) throw enoent("access", norm(p)); }),
 };
 
 export default {
   existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync,
   statSync, lstatSync, unlinkSync, renameSync, copyFileSync, rmSync, rmdirSync,
-  openSync, closeSync, fsyncSync, writeSync, createReadStream, createWriteStream,
+  openSync, closeSync, fsyncSync, writeSync, createReadStream, createWriteStream, mkdtempSync,
   watch, constants, promises,
 };

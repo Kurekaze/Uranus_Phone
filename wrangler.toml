@@ -34,7 +34,7 @@ new_sqlite_classes = ["Uranus"]
 "@grpc/grpc-js" = "./src/shims/stub.js"
 "iconv-lite" = "./src/shims/iconv-lite.js"
 "nodemailer" = "./src/shims/stub.js"
-"tar-fs" = "./src/shims/stub.js"
+"tar-fs" = "./src/shims/tar-fs.js"
 "mammoth" = "./src/shims/stub.js"
 "pdf-parse" = "./src/shims/stub.js"
 
