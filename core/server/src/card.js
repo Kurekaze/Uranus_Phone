@@ -146,6 +146,120 @@ function isLocationShare(bundleId) {
 }
 
 /**
+ * 平安确认（Check In，iOS 17+，繁中叫「報平安」）的 bundleId 前缀。
+ *
+ * 实物验过：扩展 bundleId 是 `com.apple.SafetyMonitorApp.SafetyMonitorMessages`，
+ * 走的是扩展前缀那条路。不单独认的话会落成「分享了一张卡片」—— 用户实测
+ * 角色回了句「is that the one u want」，完全不知道对方在报平安。
+ */
+const CHECK_IN_PREFIX = "com.apple.safetymonitorapp";
+
+/** 这个 bundleId 是不是平安确认。 */
+function isCheckIn(bundleId) {
+  const id = String(bundleId ?? "").toLowerCase();
+  return id === CHECK_IN_PREFIX || id.startsWith(`${CHECK_IN_PREFIX}.`);
+}
+
+/**
+ * 同一个会话里，一张平安确认后面多久之内再来的**空白**那张算重复。
+ *
+ * 实测超时那一下会连来两条：第一条带字（「報平安：尚未按預期報平安，已共享位置」），
+ * 一秒后又来一条什么都没有的。第二条不吞掉的话模型会以为对方又发了一个新的
+ * 平安确认。窗口放短：刚发起就立刻结束这种，结束那条要是恰好也没字，不能被
+ * 误吞。
+ */
+const CHECK_IN_ECHO_MS = 30_000;
+
+/** 会话 → 上一张平安确认到的时间。只为了上面那个去重，不落盘。 */
+const lastCheckInAt = new Map();
+
+/**
+ * 发起之后多久之内，同一个会话再来的**无字**卡片算「这次有变化」而不是「又发起了一次」。
+ *
+ * 用户实测：发起那张和结束那张都没带字、也读不到详情，只认「没字 = 发起」的话，
+ * 结束的那一下角色会再听一遍「发送了平安到达计时」，回一句「你要测几次」。
+ * 平安确认的计时最长也就十来个小时，窗口给 12 小时。
+ */
+const CHECK_IN_ACTIVE_MS = 12 * 3600_000;
+
+/** 会话 → 还开着的那次平安确认是什么时候发起的。超时 / 到达 / 结束 / 有变化就删掉。不落盘。 */
+const activeCheckInAt = new Map();
+
+/** 会话 → 还开着的那次「抵达时」的目的地。空白件来的时候告诉模型是去哪的那次变了。 */
+const activeCheckInDest = new Map();
+
+/** 平安确认没取到字时，隔多久再取（依次）。实测字有时晚十几秒才落到消息上。测试里改小。 */
+let CHECK_IN_RETRY_MS = [3000, 10000];
+export function _setCheckInRetryMs(ms) {
+  CHECK_IN_RETRY_MS = [].concat(ms);
+}
+
+/**
+ * 「報平安：上海市 示例路1号 (…)」—— 前缀后面跟的不是状态词，就是「抵达时」模式的目的地。
+ * 实测手机上那张卡片旁边显示的就是这一行。
+ */
+const CHECK_IN_DEST_RE = /^(?:報平安|报平安|平安確認|平安确认|check ?in)\s*[:：]\s*(.+)$/i;
+
+/**
+ * 按卡片上那行字认状态。
+ *
+ * 卡片上的字是**发件人手机的系统语言**（用户实测是繁中），所以繁简英都列上。
+ * 「超时」排在最前：超时那句可能带着「預期到達」之类的字眼，先判它才不会
+ * 被当成已到达。认不出的不猜，退回 "update"，原文照附。
+ *
+ * @returns {"start" | "overdue" | "arrived" | "ended" | "update"}
+ */
+function checkInState(text) {
+  const t = String(text ?? "").trim();
+  if (!t) return "start";
+  if (/尚未|未按|沒有按|没有按|逾時|逾期|超時|超时|not .*expected|hasn.?t|didn.?t|overdue/i.test(t)) {
+    return "overdue";
+  }
+  if (/到達|到达|抵達|抵达|arrived|safely/i.test(t)) return "arrived";
+  if (/結束|结束|取消|完成|ended|cancel|complete/i.test(t)) return "ended";
+  // 「報平安：計時已開始」—— 计时器模式的发起卡片（实物）
+  if (/開始|开始|start|began/i.test(t)) return "start";
+  return "update";
+}
+
+/**
+ * 平安确认 → 给模型的那句提示。
+ *
+ * 超时那句特意写明「位置这边拿不到」：系统确实把位置共享出去了，但共享到的是
+ * 线路那台机器的「信息」详情页，我们读不到 —— 不说清楚的话角色会顺着
+ * 「已共享位置」编一个地址出来。
+ */
+function checkInHint(state, text, extra) {
+  const raw = text ? `（原文：${text}）` : "";
+  switch (state) {
+    case "start":
+      // 文案是用户定的，照抄。发起那张卡片三种模式（计时/抵达时/体能训练）都没字，分不出来
+      return "[{{user}}发送了平安到达计时，如果到了时间用户还未确认，那么将会在15分钟后向你推送消息与共享{{user}}的位置。]";
+    case "trip": {
+      // 「抵达时」模式，并且从卡片里读出了目的地 / 预计到达（见 checkInTrip）
+      const where = extra?.destination ? `到达「${extra.destination}」时` : "到达目的地时";
+      const eta = extra?.eta ? `，预计${extra.eta}到` : "";
+      return `[{{user}}发送了平安确认：${where}会自动通知你${eta}。如果{{user}}没按时到、也没回应，15分钟后会向你推送消息与共享{{user}}的位置。]`;
+    }
+    case "changed":
+      if (extra?.destination) {
+        // 「抵达时」模式到了目的地，手机会自动发这张空白卡片；也可能是手动结束 / 延长
+        return `[系统提示:{{user}}去「${extra.destination}」的「平安确认」有变化：多半是已经到了，也可能是手动结束或者延长了时间。到没到以{{user}}说的为准]`;
+      }
+      // 没字、也读不到详情，只知道这次平安确认变了。别让模型猜是哪种，更别让它自己算时间
+      return "[系统提示:{{user}}的「平安确认」有变化：可能是到了、手动结束了，或者延长了时间，这边看不出是哪一种，别自己推断。什么时候到期以{{user}}手机上的为准]";
+    case "overdue":
+      return `[系统提示:{{user}}的「平安确认」超时了：没有按预期报平安，系统已经把{{user}}的位置共享给你，但具体在哪这边看不到${raw}]`;
+    case "arrived":
+      return `[系统提示:{{user}}的「平安确认」结束了：{{user}}已经平安到达${raw}]`;
+    case "ended":
+      return `[系统提示:{{user}}结束了这次「平安确认」${raw}]`;
+    default:
+      return `[系统提示:{{user}}的「平安确认」有更新${raw}]`;
+  }
+}
+
+/**
  * 从 balloonBundleId 里刨出这是什么气泡。
  *
  * @returns {null | {kind: "apple"|"url"|"extension", appName: string, bundleId: string}}
@@ -333,9 +447,9 @@ function layoutSummary(layout) {
  * 卡片不常见，所以这里是**用完就关**：临时开一个客户端问一句就收掉，
  * 不像 chatbg.js 那样留着长连接。token 走的是同一份缓存，不会多铸。
  *
- * @returns {Promise<null | {appName: string, title: string, url: string}>}
+ * @returns {Promise<null | {appName: string, title: string, url: string, layout: object|null, sessionId: string, live: boolean}>}
  */
-async function fetchCardDetail({ projectId, projectSecret, messageGuid, scope }) {
+async function fetchCardDetail({ projectId, projectSecret, messageGuid, scope, wantText = false }) {
   let opened = [];
   try {
     opened = await createLineClients(projectId, projectSecret, { timeout: DETAIL_TIMEOUT_MS });
@@ -344,11 +458,29 @@ async function fetchCardDetail({ projectId, projectSecret, messageGuid, scope })
       try {
         const native = await client.messages.get(messageGuid);
         const mini = native?.content?.miniApp;
-        if (!mini) continue;
+        // 平安确认实测：没有 miniApp，但单独取这条消息时 content.text 里有那行字
+        // （「報平安：計時已開始」「報平安：某某路66号」），实时推过来的那份反而是空的
+        const plain = String(native?.content?.text ?? native?.text ?? "").trim();
+        if (!mini && wantText && plain) {
+          return { appName: "", title: plain, url: "", layout: null, sessionId: "", live: false };
+        }
+        if (!mini) {
+          // 实测平安确认就是这样：消息查得到，但底层没解出 miniApp。留一行，下次好对着看
+          logDebug(
+            scope,
+            `这条消息上没有卡片详情（content 里有：${Object.keys(native?.content ?? {}).join("/") || "无"}，正文：${JSON.stringify(
+              String(native?.text ?? native?.content?.text ?? "").slice(0, 120)
+            )}）`
+          );
+          continue;
+        }
         return {
           appName: String(mini.appName ?? "").trim(),
           title: layoutSummary(mini.layout),
           url: String(mini.url ?? "").trim(),
+          layout: mini.layout ?? null,
+          sessionId: String(mini.sessionId ?? "").trim(),
+          live: Boolean(mini.live),
         };
       } catch (e) {
         logDebug(scope, `线路 ${instanceId} 上没读到这条消息：${String(e?.message ?? e)}`);
@@ -376,9 +508,10 @@ async function fetchCardDetail({ projectId, projectSecret, messageGuid, scope })
  * @param {string} [opts.projectId] 给了才会去问详情；本地 Mac 模式不要给
  * @param {string} [opts.projectSecret]
  * @param {string} [opts.label] 日志里显示的角色名
+ * @param {string} [opts.chatGuid] 这条消息所在的会话，平安确认去重用
  * @returns {Promise<string>}
  */
-export async function cardHintFor(message, { projectId, projectSecret, label } = {}) {
+export async function cardHintFor(message, { projectId, projectSecret, label, chatGuid } = {}) {
   const info = parseBalloon(message?.balloonBundleId);
   if (!info) return "";
   const scope = label ? `卡片·${label}` : "卡片";
@@ -397,6 +530,11 @@ export async function cardHintFor(message, { projectId, projectSecret, label } =
     const hint = "[系统提示:{{user}}把自己的位置共享给你了]";
     logDebug(scope, `认出位置共享（${info.bundleId}）→ ${hint}`);
     return hint;
+  }
+
+  // 平安确认同理，排在分支前面；它现在走的是扩展前缀，但别赌苹果不改
+  if (isCheckIn(info.bundleId)) {
+    return checkInHintFor(message, { projectId, projectSecret, chatGuid, scope });
   }
 
   if (info.kind === "apple") {
@@ -435,6 +573,171 @@ export async function cardHintFor(message, { projectId, projectSecret, label } =
   const hint = `[系统提示:{{user}}分享了${who}${what}${link}]`;
   logDebug(scope, `认出一张卡片（${info.bundleId}）→ ${hint}`);
   return hint;
+}
+
+/**
+ * 平安确认那一支。字从哪来和普通卡片一样：先问详情，问不到用 nativeText。
+ *
+ * 返回空串 = 这张是紧跟在上一张后面的空白重复件（见 CHECK_IN_ECHO_MS），
+ * 调用方会把整条消息当成没有内容跳过。
+ */
+async function checkInHintFor(message, { projectId, projectSecret, chatGuid, scope }) {
+  let text = "";
+  let detail = null;
+  // 按收到那一刻算：下面取字可能要等十几秒，不能让等待把空白件挤出去重窗口
+  const now = Date.now();
+  const chatKey = chatGuid && `c:${chatGuid}`;
+  const chatPrev = chatKey ? lastCheckInAt.get(chatKey) : undefined;
+  if (chatKey) lastCheckInAt.set(chatKey, now);
+  if (projectId && projectSecret && message?.id) {
+    const ask = () =>
+      fetchCardDetail({ projectId, projectSecret, messageGuid: String(message.id), scope, wantText: true });
+    detail = await ask();
+    // 刚收到那一刻字可能还没落到消息上，隔一下再问。真空白件（到了 / 结束）因此晚十几秒，无所谓
+    for (const wait of CHECK_IN_RETRY_MS) {
+      if (detail?.title) break;
+      await new Promise((r) => setTimeout(r, wait));
+      detail = (await ask()) ?? detail;
+    }
+    /*
+     * 「抵达时」那种手机上看得见目的地和预计到达，但排版字段是空的 —— 平安确认
+     * 用的是 live layout（卡片由扩展自己画），字很可能在 url 里。还没拿到实物，
+     * 先把能看的全打一行，下次实测对着看。
+     */
+    if (detail) {
+      logDebug(
+        scope,
+        `平安确认原始内容：${JSON.stringify({
+          url: detail.url,
+          sessionId: detail.sessionId,
+          live: detail.live,
+          layout: detail.layout,
+        })}`
+      );
+    }
+    text = detail?.title ?? "";
+  }
+  if (!text) text = String(message?.nativeText ?? "").trim();
+  if (text.length > 80) text = `${text.slice(0, 80)}…`;
+
+  /*
+   * 去重：同一次平安确认的各次更新共用一个 sessionId，有它就按它认；
+   * 本地模式拿不到详情，退回按会话 + 时间窗。
+   *
+   * 两个键**都记、都查**：详情是 best-effort，前一张读到了 sessionId、紧跟的
+   * 空白件恰好没读到（或者反过来）是会发生的，只认一个键的话两张对不上。
+   */
+  const keys = [detail?.sessionId && `s:${detail.sessionId}`, chatKey].filter(Boolean);
+  const seen = keys
+    .map((k) => (k === chatKey ? chatPrev : lastCheckInAt.get(k)))
+    .filter((t) => t !== undefined);
+  const prev = seen.length ? Math.max(...seen) : undefined;
+  for (const k of keys) lastCheckInAt.set(k, now);
+  if (!text && prev !== undefined && now - prev < CHECK_IN_ECHO_MS) {
+    logDebug(scope, "紧跟着上一张平安确认的空白件，当重复吞掉");
+    return "";
+  }
+  if (lastCheckInAt.size > 200) {
+    for (const [k, t] of lastCheckInAt) if (now - t > CHECK_IN_ECHO_MS) lastCheckInAt.delete(k);
+  }
+
+  if (activeCheckInAt.size > 200) {
+    for (const [k, t] of activeCheckInAt) if (now - t > CHECK_IN_ACTIVE_MS) activeCheckInAt.delete(k);
+  }
+
+  let state = checkInState(text);
+  let trip = state === "start" ? checkInTrip(detail?.url) : null;
+  if (state === "update") {
+    // 「報平安：某个地址」：前缀后面不是状态词，那就是目的地
+    const dest = text.match(CHECK_IN_DEST_RE)?.[1]?.trim();
+    if (dest) trip = { destination: dest, eta: "" };
+  }
+  if (trip) state = "trip";
+  if (state === "start" && !text) {
+    // 这个会话里还开着一次：这张没字的是那次的后续（到了 / 结束 / 延长），不是又发起了一次
+    const since = keys.map((k) => activeCheckInAt.get(k)).filter((t) => t !== undefined);
+    if (since.length && now - Math.max(...since) < CHECK_IN_ACTIVE_MS) state = "changed";
+  }
+  if (state === "changed") {
+    const dest = keys.map((k) => activeCheckInDest.get(k)).find(Boolean);
+    if (dest) trip = { destination: dest, eta: "" };
+  }
+  for (const k of keys) {
+    /*
+     * 超时了也还算开着（之后手动报平安 / 结束的空白件是这次的后续）—— 但只在真读到了详情时：
+     * 读不到字的话，超时后再发起的那张看上去也是空的，实测过，那种要当新发起
+     */
+    if (state === "start" || state === "trip" || (state === "overdue" && detail)) activeCheckInAt.set(k, now);
+    else if (state !== "update") activeCheckInAt.delete(k);
+    if (state === "trip" && trip?.destination) activeCheckInDest.set(k, trip.destination);
+    else if (state !== "update" && state !== "overdue") activeCheckInDest.delete(k);
+  }
+  if (activeCheckInDest.size > 200) {
+    for (const k of activeCheckInDest.keys()) if (!activeCheckInAt.has(k)) activeCheckInDest.delete(k);
+  }
+  const hint = checkInHint(state, text, trip);
+  logDebug(
+    scope,
+    `认出平安确认（${message?.balloonBundleId ?? ""}，正文 ${JSON.stringify(String(message?.nativeText ?? ""))}，${
+      detail ? "读到了详情" : "没读到详情"
+    }）→ ${hint}`
+  );
+  return hint;
+}
+
+/**
+ * 试着从平安确认卡片的 url 里读出「抵达时」模式的目的地和预计到达时间。
+ *
+ * **是猜的**：还没见过实物 url 长什么样。只认查询参数里名字像目的地 / 时间的那些，
+ * 认不出就返回 null，提示退回普通的发起文案 —— 宁可少说，也别给模型一个编出来的地址。
+ *
+ * @returns {null | {destination: string, eta: string}}
+ */
+export function checkInTrip(url) {
+  const raw = String(url ?? "").trim();
+  if (!raw) return null;
+  let params;
+  try {
+    params = new URL(raw).searchParams;
+  } catch {
+    return null;
+  }
+  let destination = "";
+  let eta = "";
+  for (const [k, v] of params) {
+    const key = k.toLowerCase();
+    const val = String(v ?? "").trim();
+    if (!val) continue;
+    /*
+     * 按「词」认，不按子串：`metadata` 里有 eta、`sender` 里有 end、`appName` /
+     * `senderName` 里有 name —— 按子串的话发件人名字会被念成目的地。
+     * 词 = 按 camelCase / 非字母数字切开。全小写连写的（`destinationname`）
+     * 只认几个明确的前缀。
+     */
+    const words = k
+      .split(/[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])/)
+      .map((w) => w.toLowerCase())
+      .filter(Boolean);
+    const has = (re) => words.some((w) => re.test(w));
+    if (!destination && has(/^(dest|address|place|location)/) && !/lat|lon|lng/.test(key)) {
+      destination = val.length > 60 ? `${val.slice(0, 60)}…` : val;
+    } else if (!eta && has(/^eta$|arriv|^expect|^deadline|^end$|^due$/)) {
+      eta = formatEta(val);
+    }
+  }
+  return destination || eta ? { destination, eta } : null;
+}
+
+/** 时间戳（秒 / 毫秒 / ISO）→ 「9月29日 16:45」；认不出就原样给。 */
+function formatEta(val) {
+  let ms = NaN;
+  if (/^\d{9,11}(\.\d+)?$/.test(val)) ms = Number(val) * 1000;
+  else if (/^\d{12,14}$/.test(val)) ms = Number(val);
+  else if (/\d{4}-\d{2}-\d{2}/.test(val)) ms = Date.parse(val);
+  if (!Number.isFinite(ms)) return val.length > 40 ? `${val.slice(0, 40)}…` : val;
+  const d = new Date(ms);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getMonth() + 1}月${d.getDate()}日 ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 /* ================= 转账卡片（发出去的那一半） ================= */
@@ -854,15 +1157,15 @@ function parseLatLon(ll) {
  *
  * ── 两种形态，按有没有坐标分 ──
  *
- *   有坐标  `/place?coordinate=22.817,108.3665&name=南宁万象城&span=…`
- *   没坐标  `/?q=南宁万象城`
+ *   有坐标  `/place?coordinate=31.23,121.47&name=示例商场&span=…`
+ *   没坐标  `/?q=示例商场`
  *
  * 上面那条**就是 iPhone 自己分享大头针时发出来的格式**（用户把实物链接贴过来
  * 对过了）。原来这儿拼的是 `/?ll=…&q=…`，卡片效果实测和它一模一样，但既然
  * 苹果自己用的是前者，就跟苹果一致 —— 我们发出去的和对方发过来的长一个样，
  * 顺手也让下面 parseMapsUrl 认自己发的链接时走同一条路。
  *
- * **为什么没坐标时不用 `/place?name=`**：实测 `/place?name=南宁万象城`（不带
+ * **为什么没坐标时不用 `/place?name=`**：实测 `/place?name=示例商场`（不带
  * coordinate）的 og:title 是「Minami」、缩略图 center 在 `35.43,139.62`——
  * 它去日本找了个同名的地方，而且一点也看不出错。`?q=` 那条至少标题是对的
  * （只多个 🔎 前缀）、点开能正确搜到，缩略图不准而已。宁可缩略图不准，
