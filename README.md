@@ -148,3 +148,4 @@ npx wrangler deploy
 
 - `src/`：Worker 入口，和把桌面版代码搬到 Worker 上用的替身（`src/shims/`）。
 - `core/`：桌面版 Uranus 服务端代码的**生成副本**，别直接改。
+- 
