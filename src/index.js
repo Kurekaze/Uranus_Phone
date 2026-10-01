@@ -32,11 +32,11 @@
  */
 import { DurableObject } from "cloudflare:workers";
 import { handleAsNodeRequest } from "cloudflare:node";
-import { setBackend, existsSync, writeFileSync, installFetchBodies } from "./shims/fs.js";
+import { setBackend, existsSync, readFileSync, writeFileSync, installFetchBodies } from "./shims/fs.js";
 import { installTimers } from "./shims/timers.js";
 import { installTimeZone } from "./shims/tz.js";
 import { deliverWebhook, setWebhookRegistry, waitLive } from "./shims/spectrum.js";
-import { BUILTIN_PRESETS } from "../core/assets.js";
+import { BUILTIN_PRESETS, BUILTIN_TRANSFER_LOGOS } from "../core/assets.js";
 import { verifyPass } from "./gate.js";
 
 const PORT = 8787;
@@ -72,6 +72,7 @@ export class Uranus extends DurableObject {
     });
     installTimeZone(process.env.TZ);
     seedPresets();
+    seedTransferLogos();
     setWebhookRegistry({ ensure: (id, secret) => this.ensureWebhook(id, secret) });
     this.auth = await import("../core/server/src/auth.js");
     await this.seedPassword();
@@ -304,6 +305,24 @@ function seedPresets() {
   for (const [name, json] of Object.entries(BUILTIN_PRESETS)) {
     const p = `/app/assets/presets/${name}`;
     if (!existsSync(p)) writeFileSync(p, JSON.stringify(json, null, 2));
+  }
+}
+
+/**
+ * 自带的转账 logo 放进虚拟盘（桌面版在 assets/transfer-logos/），界面上才列得出来。
+ * 内容变了就覆盖：这是随代码发的只读素材，不是用户的东西。真正画图靠的是
+ * sync-core 预渲的位图，见 shims/canvas.js。
+ */
+function seedTransferLogos() {
+  for (const [name, svg] of Object.entries(BUILTIN_TRANSFER_LOGOS)) {
+    const p = `/app/assets/transfer-logos/${name}`;
+    let old = null;
+    try {
+      old = String(readFileSync(p, "utf-8"));
+    } catch {
+      // 第一次启动还没有
+    }
+    if (old !== svg) writeFileSync(p, svg);
   }
 }
 

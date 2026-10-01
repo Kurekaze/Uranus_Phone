@@ -592,7 +592,7 @@ export const DEFAULT_CONFIG = {
         bothFailedTemplate: "",
       },
       // 发语音，默认关。TTS 密钥是全局的（ttsApi），这里只有开关和音色 ID
-      voiceSend: { enabled: false, voiceId: "" },
+      voiceSend: { enabled: false, voiceId: "", language: "", accent: "" },
       // 生图，默认关。生图模型是全局的（挑一个标了 image 分类的模型），
       // 这里只有开关 + 图生图开关 + 这个角色能用哪几张参考图
       imageGen: { enabled: false, img2img: false, refs: [] },
@@ -789,12 +789,13 @@ function normalizeModelEntry(input, id) {
  *  - `openai`    OpenAI 官方。请求和 custom 一模一样，区别只在新建时预填的地址
  *  - `gemini`    Google Gemini 原生接口（`generateContent`，`x-goog-api-key`）
  *  - `anthropic` Anthropic Claude 原生接口（`/v1/messages`，`x-api-key`）
+ *  - `novelai`   NovelAI 生图（`/ai/generate-image`，Bearer pst- 开头的令牌）。只能画图
  *
  * 认不出的、以及**老配置里压根没有这个字段的，一律算 custom** —— 用户的原话：
  * 「老版本、已经有 API 的一律是自定义 API」。老配置在加这个字段之前走的就是
  * OpenAI 兼容那一套，算成 custom 行为一个字都不变。
  */
-export const PROVIDER_TYPES = ["custom", "openai", "gemini", "anthropic"];
+export const PROVIDER_TYPES = ["custom", "openai", "gemini", "anthropic", "novelai"];
 
 function normalizeProviderType(value) {
   return PROVIDER_TYPES.includes(value) ? value : "custom";
@@ -893,6 +894,24 @@ export function resolveEndpoint(config, ref) {
 }
 
 /**
+ * 第一个能聊天的模型（启用着 + 挂了 chat 分类 + 不是 NovelAI 源）。
+ *
+ * 只给 NovelAI 翻提示词用：角色写的 `[image:…]` 是中文，NovelAI 只认英文 tag。
+ * 生图本来就是全局挑的、不看角色，翻译这一步跟着全局挑，扫的顺序和
+ * resolveImageEndpoint 一样（服务商源从上往下、模型从上往下）。
+ */
+function firstChatEndpoint(config) {
+  for (const provider of config?.providers ?? []) {
+    if (!provider?.url || provider.type === "novelai") continue;
+    for (const entry of provider.models ?? []) {
+      if (!entry.enabled || !entry.model || !entry.categories?.includes("chat")) continue;
+      return resolveEndpoint(config, { provider: provider.id, modelId: entry.id });
+    }
+  }
+  return null;
+}
+
+/**
  * 生图模型：全局挑一个。
  *
  * 和聊天/识图不一样 —— 那两条是每个角色各选各的，生图这条角色那边**只有开关**
@@ -921,6 +940,8 @@ export function resolveImageEndpoint(config) {
         negativePrompt: str(entry.negativePrompt).trim(),
         // 空串 = 不传尺寸。整档带出去，media.js 那边要 size 和 aspect_ratio 两个值
         ratio: IMAGE_RATIOS.find((r) => r.key === entry.imageRatio) ?? null,
+        // NovelAI 看不懂中文，画面描述要先翻成英文 tag，借一个聊天模型来翻
+        ...(provider.type === "novelai" ? { translator: firstChatEndpoint(config) } : {}),
       };
     }
   }
@@ -1844,11 +1865,17 @@ function normalizeHandwriting(input) {
  * 声音还是原来那个。真正的凭据在全局 config.ttsApi（见 normalizeTtsApi）。
  *
  * 留空时按当前那家 TTS 的默认音色走，不报错。
+ *
+ * language / accent 目前只对 ElevenLabs 起作用，见 media.js:synthesizeVoice。
  */
 function normalizeVoiceSend(input) {
   return {
     enabled: Boolean(input?.enabled),
     voiceId: str(input?.voiceId).trim(),
+    // ElevenLabs 的 language_code（ISO 639-1，如 en / ja）。空 = 自动，不发这个字段
+    language: str(input?.language).trim().toLowerCase(),
+    // 口音标签的内容，如 "strong British accent"。方括号由 media.js 拼，这里剥掉用户手写的
+    accent: str(input?.accent).replace(/[[\]［］]/g, "").trim(),
   };
 }
 

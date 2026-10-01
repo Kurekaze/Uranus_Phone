@@ -21,7 +21,8 @@ new_sqlite_classes = ["Uranus"]
 "node:fs" = "./src/shims/fs.js"
 "fs" = "./src/shims/fs.js"
 "node:url" = "./src/shims/url.js"
-"@napi-rs/canvas" = "./src/shims/stub.js"
+# 转账卡片那张 logo 用纯 JS 画（见 shims/canvas.js）
+"@napi-rs/canvas" = "./src/shims/canvas.js"
 "ffmpeg-static" = "./src/shims/stub.js"
 "@spectrum-ts/imessage-local" = "./src/shims/stub.js"
 # Photon SDK 的传输层换成 grpc-web（见 shims/nice-grpc.js），其余 SDK 原样用

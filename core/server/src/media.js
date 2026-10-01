@@ -35,6 +35,17 @@ import { ffmpegPath, runFfmpeg } from "./ffmpeg.js";
 import { logDebug, logInfo, logWarn } from "./logs.js";
 import { netCodes, whyNetwork } from "./net.js";
 import { GEMINI_SAFETY_OFF, apiType, geminiHeaders, geminiModelUrl } from "./apitype.js";
+import {
+  NOVELAI_TRANSLATE_PROMPT,
+  cleanTranslation,
+  imageDims,
+  needsTranslation,
+  novelaiBody,
+  novelaiRoot,
+  novelaiSize,
+  novelaiSizeLike,
+  unzipFirstImage,
+} from "./novelai.js";
 import { xmlBlockRanges } from "./websearch.js";
 
 /** 合成一条语音最多等多久。对方在 iMessage 那头看着打字指示器干等。 */
@@ -1410,7 +1421,7 @@ function clampSpeed(v) {
  *
  * 响应直接就是二进制 mp3，出错时才是 JSON —— 所以先看 res.ok 再读 body。
  */
-async function ttsElevenLabs(cfg, text, voiceId, { opus = false } = {}) {
+async function ttsElevenLabs(cfg, text, voiceId, { opus = false, language = "" } = {}) {
   // 留空时用官方文档里那个公开示例音色（Rachel），至少能出声
   const id = voiceId || "21m00Tcm4TlvDq8ikWAM";
   const url =
@@ -1427,6 +1438,8 @@ async function ttsElevenLabs(cfg, text, voiceId, { opus = false } = {}) {
     body: JSON.stringify({
       text,
       model_id: String(cfg?.model ?? "").trim() || "eleven_multilingual_v2",
+      // 角色上选了语言才发；留空（自动）时请求体和以前一样，让它自己认
+      ...(language ? { language_code: language } : {}),
       voice_settings: {
         stability: Number(cfg?.stability ?? 0.5),
         similarity_boost: Number(cfg?.similarityBoost ?? 0.75),
@@ -1539,7 +1552,7 @@ async function ttsSovits(cfg, text, voiceId) {
  * 四家都没配就返回 null，调用方据此退化成文字。
  *
  * `keepTags` 是给 synthesizeVoice 看的：这一家的**这个模型**认不认方括号的
- * 语气标签。ElevenLabs 只有 eleven_v3 认（[whispers] 这类是 v3 的功能）；
+ * 语气标签。ElevenLabs 是 v3 起才认（[whispers] 这类是 v3 引进的，v4 沿用）；
  * Fish Audio 的 S2 系（含留空时的默认模型）认方括号，老的 s1 只认圆括号。
  * 认不了的都会把它们当正文念出来 —— 那种情况下不如剥掉。
  *
@@ -1550,6 +1563,16 @@ async function ttsSovits(cfg, text, voiceId) {
  * @returns {{name: string, keepTags?: boolean, opus?: boolean,
  *            run: (text: string, voiceId: string, opts?: {opus?: boolean}) => Promise<object>}|null}
  */
+/**
+ * ElevenLabs 这个模型认不认方括号标签：模型 ID 里的版本号 ≥ 3 就认
+ * （eleven_v3、eleven_v4……）。v2 系（multilingual_v2 / turbo_v2_5 / flash_v2_5）不认。
+ * 前端 role.jsx 里有一份同样的判据，两处一起改。
+ */
+export function elevenTagsOk(model) {
+  const m = /(?:^|[^a-z0-9])v(\d+)/i.exec(String(model ?? ""));
+  return Boolean(m) && Number(m[1]) >= 3;
+}
+
 export function pickTtsSource(api, { needOpus = false } = {}) {
   const mm = api?.minimax;
   if (!needOpus && mm?.enabled && String(mm.key ?? "").trim()) {
@@ -1559,7 +1582,7 @@ export function pickTtsSource(api, { needOpus = false } = {}) {
   if (el?.enabled && String(el.key ?? "").trim()) {
     return {
       name: "ElevenLabs",
-      keepTags: /v3/i.test(String(el?.model ?? "")),
+      keepTags: elevenTagsOk(el?.model),
       opus: true,
       run: (t, v, o) => ttsElevenLabs(el, t, v, o),
     };
@@ -1607,14 +1630,22 @@ export function stripToneTags(text) {
  * @param {string} voiceId 角色上填的音色 ID（SoVITS 那家是参考音频路径），可空
  * @param {string} text 要念的内容
  * @param {string} [scope] 日志作用域
- * @param {{bubble?: boolean}} [opts] `bubble`：要发成 iMessage 语音条（不是给浏览器试听）
+ * @param {{bubble?: boolean, language?: string, accent?: string}} [opts]
+ *   `bubble`：要发成 iMessage 语音条（不是给浏览器试听）。
+ *   `language` / `accent`：角色 voiceSend 上的语言和口音，目前只有 ElevenLabs 用
  * @returns {Promise<{buffer: Buffer, mimeType: string, ext: string, duration: number|undefined, source: string, ms: number}>}
  *   `duration` 是秒数，读不出来时是 undefined —— 调用方**一定要**把它传给 voice()，
  *   不然 iMessage 那头的语音条显示 0:00。
  *   `ext` 是 `m4a`（转好了）、`caf`（没 ffmpeg，走 Opus 换壳）或者合成出来的原格式。
  * @throws {Error} 中文原因。调用方接住之后退化成文字发出去
  */
-export async function synthesizeVoice(api, voiceId, text, scope = "语音", { bubble = false } = {}) {
+export async function synthesizeVoice(
+  api,
+  voiceId,
+  text,
+  scope = "语音",
+  { bubble = false, language = "", accent = "" } = {}
+) {
   /*
    * 语音条要 m4a 或 caf。有 ffmpeg 就合成 mp3 再转 m4a（老路）；没有 ffmpeg
    * （小手机的 Worker 后端）就只剩一条路：让 TTS 直接出 Ogg Opus，换壳成 caf。
@@ -1636,7 +1667,7 @@ export async function synthesizeVoice(api, voiceId, text, scope = "语音", { bu
   if (!clean) throw new Error("语音内容是空的");
 
   /*
-   * 语气标签剥不剥，跟着 TTS 的能力走：ElevenLabs 的 v3 认方括号音效标签，
+   * 语气标签剥不剥，跟着 TTS 的能力走：ElevenLabs 的 v3 及以后认方括号音效标签，
    * 其他模型和另外两家都会把它们当正文念出来（语音里真的说一句 "whispers"）。
    * 剥掉少一分情绪，留着多一句怪话 —— 取剥掉。
    * 整条剥完一件不剩（极端情况：整条语音就是个 [laughs]）时留着原样，
@@ -1645,6 +1676,16 @@ export async function synthesizeVoice(api, voiceId, text, scope = "语音", { bu
   if (!source.keepTags) {
     const plain = stripToneTags(clean);
     if (plain) clean = plain;
+  }
+
+  /*
+   * 口音：在整条前面拼一个 [strong British accent] 这样的标签。
+   * 只有 ElevenLabs 且模型认标签（v3 及以后）时才拼 —— 别的模型会把它当正文念出来。
+   * 拼在截断之前，超长时截的是尾巴，标签保得住。
+   */
+  const accentTag = String(accent ?? "").replace(/[[\]［］]/g, "").trim();
+  if (accentTag && source.name === "ElevenLabs" && source.keepTags) {
+    clean = `[${accentTag}]${clean}`;
   }
 
   if (clean.length > MAX_TTS_CHARS) {
@@ -1670,7 +1711,7 @@ export async function synthesizeVoice(api, voiceId, text, scope = "语音", { bu
   let out;
   for (let attempt = 1; ; attempt += 1) {
     try {
-      out = await source.run(clean, id, { opus: caf });
+      out = await source.run(clean, id, { opus: caf, language: String(language ?? "").trim() });
       break;
     } catch (e) {
       if (attempt <= TTS_RETRIES && worthRetry(e)) {
@@ -2081,6 +2122,131 @@ async function geminiImage({ base, key, model, prompt, negative, refFile, ratio 
 }
 
 /**
+ * 把中文画面描述翻成 NovelAI 认的英文 tag。
+ *
+ * 借的是 config.js:resolveImageEndpoint 带出来的 `translator`（第一个能聊天的模型）。
+ * 已经是英文的不翻（用户在提示词里让角色直接写 tag 的情况）；翻失败、没有可借的
+ * 模型就原样发 —— 画歪了也比一张图都不发强，日志里说清楚为什么歪。
+ */
+async function translateForNovelai(desc, translator, scope) {
+  if (!needsTranslation(desc)) return desc;
+  if (!translator) {
+    logWarn(
+      scope,
+      "画面描述是中文，但没有能借来翻译的聊天模型，原样发给 NovelAI（它看不懂中文，画出来多半对不上）"
+    );
+    return desc;
+  }
+  try {
+    const { chatCompletion } = await import("./llm.js");
+    const out = await chatCompletion(
+      translator,
+      [
+        { role: "system", content: NOVELAI_TRANSLATE_PROMPT },
+        { role: "user", content: desc },
+      ],
+      { label: `NovelAI 提示词翻译（${translator.label}）`, maxTokens: 400, retries: 1 }
+    );
+    const tags = cleanTranslation(out);
+    if (!tags || needsTranslation(tags)) {
+      logWarn(scope, "翻译模型没给出英文 tag，原样发给 NovelAI", clipBody(out));
+      return desc;
+    }
+    logDebug(scope, `画面描述翻成 tag：${tags}`);
+    return tags;
+  } catch (e) {
+    logWarn(scope, "画面描述翻成英文失败，原样发给 NovelAI", String(e?.message ?? e));
+    return desc;
+  }
+}
+
+/**
+ * NovelAI 出图。请求体在 novelai.js 里拼，这里管发、重试和报错。
+ *
+ * 图生图：参考图照原样发过去（小手机那边没有 ffmpeg 可以缩），输出尺寸照它的
+ * 长宽比挑（不然参考图会被拉变形）。用户选了比例的话听用户的。
+ * 带参考图的那一张 Opus 也要扣 Anlas，这是 NovelAI 的规矩。
+ *
+ * @returns {Promise<{buffer: Buffer}>}
+ */
+async function novelaiImage({ base, key, model, prompt, negative, refFile, ratio }, scope) {
+  if (!key) throw new Error("NovelAI 没填密钥（网页 → 设置 → Account → Get Persistent API Token，pst- 开头那串）");
+
+  let image;
+  let [width, height] = novelaiSize(ratio?.key);
+  if (refFile) {
+    const bytes = await fs.promises.readFile(refFile);
+    image = bytes.toString("base64");
+    const dims = imageDims(bytes);
+    if (!ratio && dims) [width, height] = novelaiSizeLike(dims.width, dims.height);
+  }
+
+  const body = novelaiBody({ model, prompt, negative, width, height, image });
+  const url = `${novelaiRoot(base)}/ai/generate-image`;
+
+  let bytes;
+  let retries = 0;
+  for (;;) {
+    let res;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        signal: AbortSignal.timeout(IMAGE_TIMEOUT),
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+        body: JSON.stringify(body),
+      });
+    } catch (e) {
+      if (retries < IMAGE_RETRY_DELAYS.length && worthImageRetry(e)) {
+        const delay = IMAGE_RETRY_DELAYS[retries];
+        retries += 1;
+        logWarn(scope, `出图没连上（${whyFetch(e, IMAGE_TIMEOUT)}），${delay}ms 后重试第 ${retries} 次`);
+        await wait(delay);
+        continue;
+      }
+      throw new Error(`生图请求失败：${whyFetch(e, IMAGE_TIMEOUT)}`);
+    }
+
+    bytes = Buffer.from(await res.arrayBuffer());
+    if (res.ok) break;
+
+    const raw = bytes.toString("utf8");
+    // 429 = 同一个号上一张还没画完（NovelAI 一个号同时只画一张），等一下再来
+    if (retries < IMAGE_RETRY_DELAYS.length && transientImageFailure(res.status, raw)) {
+      const delay = IMAGE_RETRY_DELAYS[retries];
+      retries += 1;
+      logWarn(scope, `NovelAI 返回 ${res.status}，${delay}ms 后重试第 ${retries} 次`, clipBody(raw));
+      await wait(delay);
+      continue;
+    }
+    if (res.status === 401) {
+      throw new Error(
+        `NovelAI 说密钥不对（401）。要填的是 Persistent API Token（pst- 开头），不是登录密码：${clipBody(raw)}`
+      );
+    }
+    if (res.status === 402) {
+      throw new Error(
+        `NovelAI 说要付费（402）：没有订阅，或者 Anlas 不够。` +
+          `Opus 免费出图只限不带参考图、不超过 1024×1024 的那种：${clipBody(raw)}`
+      );
+    }
+    throw new Error(`NovelAI 返回 ${res.status}：${clipBody(raw)}`);
+  }
+
+  // 官方回 zip；有的中转站直接回图片，或者回 JSON 里装 base64 —— 三种都认
+  const zipped = await unzipFirstImage(bytes);
+  if (zipped?.length) return { buffer: zipped, width, height };
+  if (sniffImageType(bytes)) return { buffer: bytes, width, height };
+  const raw = bytes.toString("utf8");
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    throw new Error(`NovelAI 回的东西既不是 zip 也不是图片：${clipBody(raw)}`);
+  }
+  return { buffer: await parseImageResponse(data, raw, scope), width, height };
+}
+
+/**
  * 出一张图。
  *
  * 两条路：
@@ -2135,6 +2301,23 @@ export async function generateImage(endpoint, req, scope = "生图") {
   );
   // 用户没选比例时是 null，下面两条路都据此整个跳过，一个字段都不加
   const ratio = endpoint?.ratio ?? null;
+
+  // NovelAI 走它自己的接口；中文描述先翻成英文 tag，正面提示词照样拼在前面
+  if (type === "novelai") {
+    const tags = await translateForNovelai(desc, endpoint?.translator, scope);
+    const { buffer, width, height } = await novelaiImage(
+      { base, key, model, prompt: positive ? `${positive}, ${tags}` : tags, negative, refFile, ratio },
+      scope
+    );
+    const ms = Date.now() - startedAt;
+    const { mimeType, ext } = sniffImage(buffer);
+    logInfo(
+      scope,
+      `${endpoint?.label ?? model} 出图成功，${Math.round(buffer.length / 1024)}KB ${ext}，` +
+        `${width}×${height}，耗时 ${ms}ms${refFile ? `（参考图 ${path.basename(refFile)}）` : ""}`
+    );
+    return { buffer, mimeType, ext, ms };
+  }
 
   // Gemini 类型走原生接口，请求和响应都是另一个样子，见 geminiImage
   if (type === "gemini") {

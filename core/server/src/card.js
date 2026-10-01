@@ -188,11 +188,15 @@ const activeCheckInAt = new Map();
 /** 会话 → 还开着的那次「抵达时」的目的地。空白件来的时候告诉模型是去哪的那次变了。 */
 const activeCheckInDest = new Map();
 
-/** 平安确认没取到字时，隔多久再取（依次）。实测字有时晚十几秒才落到消息上。测试里改小。 */
-let CHECK_IN_RETRY_MS = [3000, 10000];
-export function _setCheckInRetryMs(ms) {
-  CHECK_IN_RETRY_MS = [].concat(ms);
-}
+/**
+ * 会话 → 发起时没读到字的那张平安确认卡片的消息 id。
+ *
+ * 实测「我抵达时」的发起卡片，那行「報平安：某某路1号」可能过了一阵才落到消息上，
+ * 当场取三次都是空的。所以先按「发起了」告诉角色，等同一会话的下一张卡片（到了 /
+ * 超时 / 结束）来时再读一遍这张，读出目的地就在那条提示里带上。不落盘。
+ */
+const unreadCheckIn = new Map();
+
 
 /**
  * 「報平安：上海市 示例路1号 (…)」—— 前缀后面跟的不是状态词，就是「抵达时」模式的目的地。
@@ -233,8 +237,8 @@ function checkInHint(state, text, extra) {
   const raw = text ? `（原文：${text}）` : "";
   switch (state) {
     case "start":
-      // 文案是用户定的，照抄。发起那张卡片三种模式（计时/抵达时/体能训练）都没字，分不出来
-      return "[{{user}}发送了平安到达计时，如果到了时间用户还未确认，那么将会在15分钟后向你推送消息与共享{{user}}的位置。]";
+      // 发起那张卡片三种模式（计时/抵达时/体能训练）多半没字、分不出来，一律用这句（用户定的）
+      return PENDING_CHECK_IN_HINT;
     case "trip": {
       // 「抵达时」模式，并且从卡片里读出了目的地 / 预计到达（见 checkInTrip）
       const where = extra?.destination ? `到达「${extra.destination}」时` : "到达目的地时";
@@ -244,10 +248,10 @@ function checkInHint(state, text, extra) {
     case "changed":
       if (extra?.destination) {
         // 「抵达时」模式到了目的地，手机会自动发这张空白卡片；也可能是手动结束 / 延长
-        return `[系统提示:{{user}}去「${extra.destination}」的「平安确认」有变化：多半是已经到了，也可能是手动结束或者延长了时间。到没到以{{user}}说的为准]`;
+        return `[系统提示:{{user}}去「${extra.destination}」的「平安确认」有变化：多半是已经到了，也可能是手动结束、延长了时间或者超时没报平安。到没到以{{user}}说的为准]`;
       }
       // 没字、也读不到详情，只知道这次平安确认变了。别让模型猜是哪种，更别让它自己算时间
-      return "[系统提示:{{user}}的「平安确认」有变化：可能是到了、手动结束了，或者延长了时间，这边看不出是哪一种，别自己推断。什么时候到期以{{user}}手机上的为准]";
+      return "[系统提示:{{user}}的「平安确认」有变化：可能是到了、手动结束了、延长了时间，或者超时没报平安，这边看不出是哪一种，别自己推断。什么时候到期以{{user}}手机上的为准]";
     case "overdue":
       return `[系统提示:{{user}}的「平安确认」超时了：没有按预期报平安，系统已经把{{user}}的位置共享给你，但具体在哪这边看不到${raw}]`;
     case "arrived":
@@ -581,6 +585,22 @@ export async function cardHintFor(message, { projectId, projectSecret, label, ch
  * 返回空串 = 这张是紧跟在上一张后面的空白重复件（见 CHECK_IN_ECHO_MS），
  * 调用方会把整条消息当成没有内容跳过。
  */
+/** 平安确认没取到字时，隔多久再取（依次）。实测字有时晚十几秒才落到消息上。测试里改小。 */
+let CHECK_IN_RETRY_MS = [3000, 10000];
+export function _setCheckInRetryMs(ms) {
+  CHECK_IN_RETRY_MS = [].concat(ms);
+}
+
+/**
+ * 发起卡片（读不到地址的抵达时 / 计时 / 体能训练）一律发这句（文案是用户定的）。
+ *
+ * 实测（2026-09-30）：「我抵达时」进行中，发起卡片上一个字都没有，整条消息只剩
+ * balloonBundleId；那行「報平安：地址」要等这次到了 / 取消才写上去。所以进行中
+ * 读不到地址，只能等结束那张来时补读（见 unreadCheckIn）。
+ */
+const PENDING_CHECK_IN_HINT =
+  "[{{user}}发送了一张平安确认：到达目的地时 / 计时结束后会自动通知你，如果{{user}}没按时到、也没回应，15分钟后会向你推送消息与共享{{user}}的位置。但目前系统暂时无法识别具体位置，请根据上下文和人设回应{{user}}，禁止瞎编目的地。]";
+
 async function checkInHintFor(message, { projectId, projectSecret, chatGuid, scope }) {
   let text = "";
   let detail = null;
@@ -645,6 +665,19 @@ async function checkInHintFor(message, { projectId, projectSecret, chatGuid, sco
     for (const [k, t] of activeCheckInAt) if (now - t > CHECK_IN_ACTIVE_MS) activeCheckInAt.delete(k);
   }
 
+  // 上一张发起卡片当时没读到字：这会儿再读一次，读出目的地就记上（见 unreadCheckIn）
+  const unreadId = chatKey ? unreadCheckIn.get(chatKey) : undefined;
+  if (chatKey) unreadCheckIn.delete(chatKey);
+  if (unreadId && projectId && projectSecret) {
+    const again = await fetchCardDetail({ projectId, projectSecret, messageGuid: unreadId, scope, wantText: true });
+    const late = again?.title ?? "";
+    const dest = checkInState(late) === "update" ? late.match(CHECK_IN_DEST_RE)?.[1]?.trim() : "";
+    if (dest) {
+      logDebug(scope, `补读到上一张平安确认的目的地：${dest}`);
+      for (const k of keys) activeCheckInDest.set(k, dest);
+    }
+  }
+
   let state = checkInState(text);
   let trip = state === "start" ? checkInTrip(detail?.url) : null;
   if (state === "update") {
@@ -674,6 +707,10 @@ async function checkInHintFor(message, { projectId, projectSecret, chatGuid, sco
   }
   if (activeCheckInDest.size > 200) {
     for (const k of activeCheckInDest.keys()) if (!activeCheckInAt.has(k)) activeCheckInDest.delete(k);
+  }
+  if (state === "start" && !text && chatKey && message?.id) {
+    unreadCheckIn.set(chatKey, String(message.id));
+    if (unreadCheckIn.size > 200) unreadCheckIn.delete(unreadCheckIn.keys().next().value);
   }
   const hint = checkInHint(state, text, trip);
   logDebug(
