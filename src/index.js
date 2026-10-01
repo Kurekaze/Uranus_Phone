@@ -77,6 +77,7 @@ export class Uranus extends DurableObject {
     this.auth = await import("../core/server/src/auth.js");
     await this.seedPassword();
     await import("../core/server/src/index.js");
+    await installRestart();
     await this.arm();
   }
 
@@ -298,6 +299,29 @@ function photonApi(projectId, projectSecret) {
 async function sha256(text) {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * 「重启整个服务」在这里的样子（控制台按钮、`/重启` 指令、定时重启三条路）。
+ *
+ * 桌面版是让进程退出、由启动器拉起来。这边退不了：重置 DO（ctx.abort）只会
+ * 扔掉计时器和连接，模块还缓存在同一个 isolate 里，启动流程不会重跑 —— 日记、
+ * IG、主动消息的定时器全停，比不重启还糟。
+ *
+ * 所以注册成「原地重来」：restart.js 先照旧停掉所有桥接，再调这里清缓存、
+ * 按配置把连接重新连上。定时器本来就活着，不用动。
+ */
+async function installRestart() {
+  const [{ setInProcessRestart }, { clearCaches }, { syncBridges }, { loadConfig }] = await Promise.all([
+    import("../core/server/src/restart.js"),
+    import("../core/server/src/maintenance.js"),
+    import("../core/server/src/imessage.js"),
+    import("../core/server/src/config.js"),
+  ]);
+  setInProcessRestart(async () => {
+    clearCaches("重启");
+    await syncBridges(loadConfig);
+  });
 }
 
 /** 内置的两份默认预设放进虚拟盘，桌面版第一次建 data/presets 时会从这里拷 */
