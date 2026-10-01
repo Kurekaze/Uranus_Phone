@@ -23,10 +23,20 @@ let kv = null;
  */
 const mem = new Map(); // 绝对路径 → Uint8Array | string
 const memRoots = new Set();
+const memDirs = new Set(); // 内存树里显式建过的目录（mkdirSync/写文件时顺手记的父目录）
 
 function inMem(p) {
   for (const r of memRoots) if (p === r || p.startsWith(r + "/")) return true;
   return false;
+}
+
+/** 内存树里的目录标记：从 p 往上记到最近已记过的祖先，和 markDirs 对 KV 做的事一样。 */
+function markMemDirs(p) {
+  let cur = p;
+  while (cur !== "/" && !memDirs.has(cur) && !memRoots.has(cur)) {
+    memDirs.add(cur);
+    cur = parentOf(cur);
+  }
 }
 
 export function setBackend(storageKv) {
@@ -63,7 +73,7 @@ function enoent(op, p) {
 
 function isDir(p) {
   if (p === "/") return true;
-  if (memRoots.has(p)) return true;
+  if (inMem(p)) return memRoots.has(p) || memDirs.has(p);
   if (need().get("d:" + p) !== undefined) return true;
   // 没有显式标记，但底下有文件，也算目录
   for (const _ of need().list({ prefix: "f:" + p + "/", limit: 1 })) return true;
@@ -115,7 +125,10 @@ export function readFileSync(p, opts) {
 
 export function writeFileSync(p, data) {
   const n = norm(p);
-  if (inMem(n)) return void mem.set(n, toStored(data));
+  if (inMem(n)) {
+    markMemDirs(parentOf(n));
+    return void mem.set(n, toStored(data));
+  }
   markDirs(parentOf(n));
   need().put("f:" + n, toStored(data));
 }
@@ -128,7 +141,9 @@ export function appendFileSync(p, data) {
 }
 
 export function mkdirSync(p) {
-  markDirs(norm(p));
+  const n = norm(p);
+  if (inMem(n)) return void markMemDirs(n);
+  markDirs(n);
 }
 
 export function readdirSync(p, opts) {
@@ -136,13 +151,28 @@ export function readdirSync(p, opts) {
   if (!isDir(n)) throw enoent("scandir", n);
   const base = n === "/" ? "/" : n + "/";
   const names = new Map();
-  for (const kind of ["f:", "d:"]) {
-    for (const [key] of need().list({ prefix: kind + base })) {
-      const rest = key.slice(kind.length + base.length);
+  if (inMem(n)) {
+    for (const key of mem.keys()) {
+      if (!key.startsWith(base)) continue;
+      const rest = key.slice(base.length);
       const name = rest.split("/")[0];
       if (!name) continue;
-      const dir = kind === "d:" || rest.includes("/");
-      names.set(name, names.get(name) || dir);
+      names.set(name, names.get(name) || rest.includes("/"));
+    }
+    for (const dir of [...memDirs, ...memRoots]) {
+      if (!dir.startsWith(base)) continue;
+      const name = dir.slice(base.length).split("/")[0];
+      if (name) names.set(name, true);
+    }
+  } else {
+    for (const kind of ["f:", "d:"]) {
+      for (const [key] of need().list({ prefix: kind + base })) {
+        const rest = key.slice(kind.length + base.length);
+        const name = rest.split("/")[0];
+        if (!name) continue;
+        const dir = kind === "d:" || rest.includes("/");
+        names.set(name, names.get(name) || dir);
+      }
     }
   }
   const list = [...names.keys()].sort();
@@ -200,7 +230,7 @@ export function renameSync(from, to) {
 
 export function copyFileSync(from, to) {
   const a = norm(from);
-  const v = need().get("f:" + a);
+  const v = getFile(a);
   if (v === undefined) throw enoent("copyfile", a);
   writeFileSync(to, v);
 }
@@ -209,6 +239,7 @@ export function rmSync(p, opts) {
   const n = norm(p);
   if (inMem(n)) {
     for (const k of [...mem.keys()]) if (k === n || k.startsWith(n + "/")) mem.delete(k);
+    for (const d of [...memDirs]) if (d === n || d.startsWith(n + "/")) memDirs.delete(d);
     memRoots.delete(n);
     return;
   }

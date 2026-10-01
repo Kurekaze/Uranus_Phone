@@ -43,7 +43,7 @@ const PORT = 8787;
 const HEARTBEAT_MS = 30_000;
 const PHOTON = "https://spectrum.photon.codes";
 const COOKIE = "uranus_session";
-const RESTORE_PATHS = new Set(["/api/cloud/pull", "/api/backup/full/restore"]);
+const RESTORE_PATHS = new Set(["/api/cloud/pull"]);
 
 export class Uranus extends DurableObject {
   constructor(ctx, env) {
@@ -225,15 +225,13 @@ export class Uranus extends DurableObject {
       headers.set("cookie", `${COOKIE}=${encodeURIComponent(session.token)}`);
     } else if (bearer) headers.set("cookie", `${COOKIE}=${encodeURIComponent(bearer)}`);
 
-    // 云备份在这边只管往上传：解包要的临时空间和内存 Worker 给不起
+    // 云备份（从云盘整包拉取）没做：那条路会先把包存一份在云盘上，小手机这边不管云盘
     if (req.method === "POST" && RESTORE_PATHS.has(url.pathname)) {
       return withCors(
         Response.json(
           {
             ok: false,
-            error:
-              "小手机不支持从备份包恢复。要搬回来的话：配置用「导出配置」那份 JSON 导入，" +
-              "记忆库在记忆库面板里单独导入；或者把包拿到桌面版，用「完整备份」那里恢复。",
+            error: "小手机不支持从云盘拉取备份。要恢复的话：用「从备份恢复」那里上传 .tar.gz 或 .json。",
           },
           { status: 400 }
         ),
