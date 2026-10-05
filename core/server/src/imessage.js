@@ -134,6 +134,12 @@ import {
   textResultsNote,
 } from "./mcp.js";
 import { batchText, injectPhoneNote, phoneNote, runGenerate as runPhoneGenerate } from "./phonecheck.js";
+import {
+  generate as generateTheater,
+  reactionPrompt,
+  retry as retryTheater,
+  waitJob as waitTheater,
+} from "./theater.js";
 
 /**
  * iMessage 桥接模块（多号码版）。
@@ -1967,6 +1973,49 @@ async function handleCommand(getConfig, runner, space, spaceId, userText, peer =
    *
    * 成功失败都只发一条消息、都不进历史存档 —— 和别的指令一个待遇。
    */
+  /*
+   * 小剧场那几条：一次要好几分钟，挂着「正在输入」等那么久不像话。所以先回一句
+   * 「开始生成」，生成在后台跑，跑完再发一条（成品标题 + 一小段正文）。
+   * 两条都不进历史存档。HTML 本身在 iMessage 里显示不了，去控制台「小剧场」里看。
+   */
+  if (result.theater) {
+    const t = result.theater;
+    let job;
+    try {
+      const config = getConfig();
+      job = t.playId ? retryTheater(config, t.playId) : generateTheater(config, { roleId: role.id, templateId: t.templateId, prompt: t.prompt });
+    } catch (e) {
+      await sendSystem(runner, space, `⚠️ 小剧场没开始：${String(e?.message ?? e)}`, { what: "小剧场" }).catch(() => {});
+      return true;
+    }
+    await sendSystem(runner, space, `🎭 开始生成「${t.title}」，要一两分钟，好了发你。`, { what: "小剧场" }).catch((e) =>
+      logWarn(scope, "小剧场的「开始生成」没发出去", e)
+    );
+    waitTheater(job).then(
+      async (play) => {
+        await sendSystem(
+          runner,
+          space,
+          `🎭《${play.title}》生成好了，去浏览器的「小剧场」里看完整页面。\n\n${String(play.text ?? "").slice(0, 160)}…`,
+          { what: "小剧场" }
+        );
+        /*
+         * 生成后注入当前会话（照插件 inject_after_generation）：等 5 秒，把
+         * 「注入提示词 + 小剧场提示词 + 正文」当成对方发来的一轮交给 handleTurn ——
+         * 角色照常回复、照常发出去，这一轮和回复一起进会话历史，之后聊天都带着它。
+         * 和插件一样只在指令这条路上做；面板里生成的不注入。
+         */
+        const config = getConfig();
+        if (!config.theater?.injectAfterGeneration) return;
+        await sleep(5);
+        logInfo(scope, `小剧场《${play.title}》注入当前会话，让角色回应`);
+        await handleTurn(getConfig, runner, space, spaceId, reactionPrompt(config, play), [], peer, {});
+      },
+      (e) => sendSystem(runner, space, `⚠️ 小剧场没生成出来：${String(e?.message ?? e)}`, { what: "小剧场" })
+    ).catch((e) => logError(scope, "小剧场的结果没发出去（或者注入之后的回复失败了）", e));
+    return true;
+  }
+
   /*
    * `/查手机`：和 /memory 同一个路子，生成在这儿做、要 await（对方看得到「正在输入」）。
    * 结果只发一条消息，不进历史存档。
