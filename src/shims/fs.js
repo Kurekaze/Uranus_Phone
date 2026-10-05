@@ -6,8 +6,16 @@
  * 样子，这些模块就能原样跑，不用逐个改成 async。
  *
  * 只实现 server 里实际用到的那十几个函数。键：
- *   f:<绝对路径>   文件内容（string 或 Uint8Array）
+ *   f:<绝对路径>   文件内容（string 或 Uint8Array），大文件是一个分块标记（见下）
  *   d:<绝对路径>   目录标记（值是 1）
+ *   c:<绝对路径>#<序号>  大文件的分块
+ *
+ * ── 大文件分块 ──
+ *
+ * SQLite 版 DO 的 KV 单个值最多 2 MB，而 IG 帖子图、生图结果动不动就过 2 MB，
+ * 直接 put 会抛错。所以超过 CHUNK 的文件拆成几块存在 `c:` 键下，`f:` 那儿只放
+ * `{ [CHUNKED]: 块数, str: 原来是不是字符串 }`。读、删、改名都经过 kvRead /
+ * kvWrite / kvDelete，外面的函数看不出区别。
  *
  * DO 构造时调 setBackend(ctx.storage.kv)。一个 Worker 只有一个 DO 实例，
  * 所以放模块级全局就够了。
@@ -80,8 +88,47 @@ function isDir(p) {
   return false;
 }
 
+const CHUNK = 1_000_000;
+const CHUNKED = "__uranusChunks";
+
+/** 拆块存的文件有几块；不是分块标记就返回 0。 */
+const chunkCount = (v) => (v && typeof v === "object" && !(v instanceof Uint8Array) && v[CHUNKED]) || 0;
+
+function kvRead(p) {
+  const v = need().get("f:" + p);
+  const n = chunkCount(v);
+  if (!n) return v;
+  const parts = [];
+  for (let i = 0; i < n; i++) {
+    const c = need().get(`c:${p}#${i}`);
+    if (c === undefined) throw new Error(`文件 ${p} 的第 ${i + 1}/${n} 块不见了`);
+    parts.push(c);
+  }
+  const bytes = concat(parts);
+  return v.str ? new TextDecoder().decode(bytes) : bytes;
+}
+
+function kvDeleteChunks(p) {
+  const n = chunkCount(need().get("f:" + p));
+  for (let i = 0; i < n; i++) need().delete(`c:${p}#${i}`);
+}
+
+function kvWrite(p, v) {
+  kvDeleteChunks(p);
+  const bytes = typeof v === "string" ? (v.length > CHUNK / 4 ? new TextEncoder().encode(v) : null) : v;
+  if (!bytes || bytes.length <= CHUNK) return void need().put("f:" + p, v);
+  const n = Math.ceil(bytes.length / CHUNK);
+  for (let i = 0; i < n; i++) need().put(`c:${p}#${i}`, bytes.slice(i * CHUNK, (i + 1) * CHUNK));
+  need().put("f:" + p, { [CHUNKED]: n, str: typeof v === "string" });
+}
+
+function kvDelete(p) {
+  kvDeleteChunks(p);
+  need().delete("f:" + p);
+}
+
 function getFile(p) {
-  return inMem(p) ? mem.get(p) : need().get("f:" + p);
+  return inMem(p) ? mem.get(p) : kvRead(p);
 }
 
 function isFile(p) {
@@ -130,7 +177,7 @@ export function writeFileSync(p, data) {
     return void mem.set(n, toStored(data));
   }
   markDirs(parentOf(n));
-  need().put("f:" + n, toStored(data));
+  kvWrite(n, toStored(data));
 }
 
 export function appendFileSync(p, data) {
@@ -207,18 +254,19 @@ export function unlinkSync(p) {
   const n = norm(p);
   if (!isFile(n)) throw enoent("unlink", n);
   if (inMem(n)) return void mem.delete(n);
-  need().delete("f:" + n);
+  kvDelete(n);
 }
 
 export function renameSync(from, to) {
   const a = norm(from), b = norm(to);
   if (isFile(a)) {
-    writeFileSync(b, need().get("f:" + a));
-    need().delete("f:" + a);
+    writeFileSync(b, kvRead(a));
+    kvDelete(a);
     return;
   }
   if (!isDir(a)) throw enoent("rename", a);
-  for (const kind of ["f:", "d:"]) {
+  // 分块跟着 f: 的标记原样搬过去（键名里带着路径，c: 也得一起改）
+  for (const kind of ["f:", "d:", "c:"]) {
     for (const [key, v] of [...need().list({ prefix: kind + a + "/" })]) {
       need().put(kind + b + key.slice(kind.length + a.length), v);
       need().delete(key);
@@ -243,12 +291,12 @@ export function rmSync(p, opts) {
     memRoots.delete(n);
     return;
   }
-  if (isFile(n)) return need().delete("f:" + n);
+  if (isFile(n)) return kvDelete(n);
   if (!isDir(n)) {
     if (opts?.force) return;
     throw enoent("rm", n);
   }
-  for (const kind of ["f:", "d:"]) {
+  for (const kind of ["f:", "d:", "c:"]) {
     for (const [key] of [...need().list({ prefix: kind + n + "/" })]) need().delete(key);
   }
   need().delete("d:" + n);
