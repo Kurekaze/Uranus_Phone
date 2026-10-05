@@ -402,21 +402,95 @@ function startJob(kind, title, run) {
   jobs.set(job.id, job);
   // 只留最近 30 个
   while (jobs.size > 30) jobs.delete(jobs.keys().next().value);
-  (async () => {
+  const done = (async () => {
     try {
       const play = await run();
       job.playId = play.id;
       job.status = "done";
       logInfo(SCOPE, `「${play.title}」生成好了，${Math.round((Date.now() - job.startedAt) / 1000)} 秒`);
+      return play;
     } catch (e) {
       job.status = "error";
       job.error = String(e?.message ?? e);
       logError(SCOPE, `「${title}」没能生成`, job.error);
+      return null;
     } finally {
       job.endedAt = Date.now();
     }
   })();
+  // 不可枚举：面板那边 JSON 序列化任务时不带它。iMessage 指令那条路要等它（waitJob）
+  Object.defineProperty(job, "done", { value: done });
   return job;
+}
+
+/** 等一个任务跑完。成功给成品记录，失败抛出那句错误。 */
+export async function waitJob(job) {
+  const play = await job.done;
+  if (!play) throw new Error(job.error || "没能生成");
+  return play;
+}
+
+/* ================= iMessage 指令用 ================= */
+
+export function listTemplates() {
+  return loadState().templates;
+}
+
+/**
+ * 按标题或目录编号（从 1 开始，和「小剧场目录」那份顺序一致）找模板。
+ * 和插件一样：编号跟着模板当前的顺序走，删了中间的，后面的编号会往前挪。
+ */
+export function findTemplate(arg) {
+  const s = String(arg ?? "").trim();
+  if (!s) return null;
+  const list = listTemplates();
+  if (/^\d+$/.test(s)) return list[Number(s) - 1] ?? null;
+  return list.find((t) => t.title === s) ?? list.find((t) => t.title.toLowerCase() === s.toLowerCase()) ?? null;
+}
+
+/** 插件原版的注入提示词。config.theater.injectionPrompt 留空时用它。 */
+export const DEFAULT_INJECTION_PROMPT = "[系统提示]这是你的真实经历与内容，请根据你当前人设，直接自然回应用户。";
+
+/** 小剧场正文注入时的字数上限：长篇 HTML 抽出来的字可能上万，整段塞进上下文太亏。 */
+const INJECT_MAX_CHARS = 6000;
+
+/**
+ * 「生成后注入当前会话」那条消息，照插件 _reaction_request 的格式拼：
+ *
+ *   注入提示词
+ *   [小剧场提示词]
+ *   这次的提示词            ← 设置里可以关掉
+ *   [小剧场正文]
+ *   从 HTML 里抽出来的纯文字（不带 CSS / JS / 标签）
+ *
+ * 这条会当成用户发来的一轮交给角色回复，和回复一起进会话历史（插件也是这么存的）。
+ */
+export function reactionPrompt(config, play) {
+  const t = config.theater ?? {};
+  let text = "";
+  try {
+    text = htmlText(readPlayHtml(play.id));
+  } catch {
+    text = String(play.text ?? "");
+  }
+  if (text.length > INJECT_MAX_CHARS) text = `${text.slice(0, INJECT_MAX_CHARS)}…`;
+  const parts = [];
+  // 和插件一样：留空 = 不加这一句（默认值在 config.js:normalizeTheater 里填好了）
+  const lead = String(t.injectionPrompt ?? DEFAULT_INJECTION_PROMPT).trim();
+  if (lead) parts.push(lead);
+  const prompt = String(play.snapshot?.templatePrompt ?? "").trim();
+  if (t.injectTheaterPrompt !== false && prompt) parts.push("[小剧场提示词]", prompt);
+  parts.push("[小剧场正文]", text);
+  return parts.join("\n\n");
+}
+
+/** 这个角色最近一次生成的成品（「小剧场 重试」用）。 */
+export function latestPlayOf(roleId) {
+  return (
+    loadState()
+      .plays.filter((p) => p.roleId === roleId && p.snapshot)
+      .sort((a, b) => b.createdAt - a.createdAt)[0] ?? null
+  );
 }
 
 /* ================= 对外 ================= */
@@ -458,11 +532,15 @@ export function generate(config, { roleId, templateId, prompt, bookIds }) {
   }
   if (!text) throw new Error("提示词是空的");
 
-  // 记住这个角色这次勾的世界书，下次默认还是这几本
-  state.roleBooks[role.id] = Array.isArray(bookIds) ? bookIds : [];
-  saveState(state);
+  // 记住这个角色这次勾的世界书，下次默认还是这几本。没传（iMessage 指令那条路）
+  // 就用上次在面板里勾的
+  if (Array.isArray(bookIds)) {
+    state.roleBooks[role.id] = bookIds;
+    saveState(state);
+  }
+  const books = Array.isArray(bookIds) ? bookIds : state.roleBooks[role.id] ?? [];
 
-  const snap = buildSnapshot(config, role, { title, prompt: text, bookIds });
+  const snap = buildSnapshot(config, role, { title, prompt: text, bookIds: books });
   logInfo(
     SCOPE,
     `开始生成「${title}」（${role.name}${snap.bookNames.length ? `，世界书：${snap.bookNames.join("、")}` : ""}` +
